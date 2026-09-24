@@ -5,6 +5,8 @@ InsightFace for detection and identity embeddings (`buffalo_l`) and the
 `inswapper_128` model for the swap itself. Includes a command-line tool and a
 small Gradio web UI.
 
+An on-device Android version lives in [`android/`](android/README.md).
+
 ## Install
 
 ```bash

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Two overlapping face outlines with arrows between them. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:pathData="M42,40 m-10,0 a10,12 0 1,0 20,0 a10,12 0 1,0 -20,0" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#9CC7FF"
+        android:strokeWidth="3"
+        android:pathData="M66,68 m-10,0 a10,12 0 1,0 20,0 a10,12 0 1,0 -20,0" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:pathData="M58,34 C70,34 74,40 74,48 M70,44 L74,49 L78,44" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#9CC7FF"
+        android:strokeWidth="3"
+        android:pathData="M50,74 C38,74 34,68 34,60 M30,64 L34,59 L38,64" />
+</vector>

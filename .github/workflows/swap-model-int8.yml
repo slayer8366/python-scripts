@@ -1,0 +1,59 @@
+name: Build int8 swap model
+
+# Builds the Android app's fast-mode swap model from the official InsightFace
+# download with android/tools/quantize_swapper.py and attaches it to a
+# release. The app pins the published files' SHA-256 hashes, so rebuilding
+# under a new tag means updating ModelStore too.
+on:
+  workflow_dispatch:
+  push:
+    paths: ["android/tools/quantize_swapper.py", ".github/workflows/swap-model-int8.yml"]
+
+permissions:
+  contents: write
+
+env:
+  TAG: swap-model-int8-v1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pinned tools
+        run: >
+          pip install insightface==2.0 onnx==1.23.0 onnxruntime==1.30.0 numpy==2.4.6
+          opencv-python-headless==5.0.0.93 scikit-image==0.26.0 scipy==1.17.1
+      - name: Download official models
+        run: |
+          base=https://github.com/deepinsight/insightface/releases/download/model-zoo
+          mkdir -p m/models/buffalo_l
+          curl -sSfL -o m/models/inswapper_128.onnx $base/inswapper_128.onnx
+          curl -sSfL -o buffalo_l.zip $base/buffalo_l.zip
+          unzip -q buffalo_l.zip det_10g.onnx w600k_r50.onnx -d m/models/buffalo_l
+          echo "e4a3f08c753cb72d04e10aa0f7dbe3deebbf39567d4ead6dce08e98aa49e16af  m/models/inswapper_128.onnx" | sha256sum -c
+          echo "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91  m/models/buffalo_l/det_10g.onnx" | sha256sum -c
+          echo "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43  m/models/buffalo_l/w600k_r50.onnx" | sha256sum -c
+      - name: Quantize
+        run: python android/tools/quantize_swapper.py m out
+      - name: Hashes
+        run: cd out && sha256sum inswapper_128_int8.onnx inswapper_emap.bin | tee SHA256SUMS
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: int8 swap model (v1)
+          target_commitish: ${{ github.sha }}
+          body: |
+            Fast-mode swap model for the Android app, built by this workflow from the
+            official InsightFace `inswapper_128.onnx` with `android/tools/quantize_swapper.py`.
+
+            InsightFace's pretrained models, and this derivative, are licensed for
+            **non-commercial research use only**.
+          files: |
+            out/inswapper_128_int8.onnx
+            out/inswapper_emap.bin
+            out/SHA256SUMS
