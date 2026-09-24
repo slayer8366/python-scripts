@@ -1,5 +1,6 @@
 package io.github.slayer8366.faceswap
 
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -10,6 +11,9 @@ sealed interface JobStatus {
     data class Running(val title: String, val detail: String, val fraction: Float?) : JobStatus
     data class Done(val message: String, val output: Uri?) : JobStatus
     data class Failed(val message: String) : JobStatus
+
+    /** One swapped frame, shown before committing to a full run. */
+    class Preview(val before: Bitmap, val after: Bitmap, val message: String) : JobStatus
 }
 
 object Jobs {

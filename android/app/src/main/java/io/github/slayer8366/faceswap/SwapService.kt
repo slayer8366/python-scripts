@@ -40,7 +40,7 @@ class SwapService : Service() {
             cancelled = true
             return START_NOT_STICKY
         }
-        if (intent == null || (action != ACTION_DOWNLOAD && action != ACTION_SWAP)) {
+        if (intent == null || action !in listOf(ACTION_DOWNLOAD, ACTION_SWAP, ACTION_PREVIEW)) {
             stopSelf(startId)
             return START_NOT_STICKY
         }
@@ -50,12 +50,16 @@ class SwapService : Service() {
             return START_NOT_STICKY
         }
 
-        val swapping = action == ACTION_SWAP
+        val processing = action != ACTION_DOWNLOAD
         currentType = when {
-            swapping && Build.VERSION.SDK_INT >= 35 -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
+            processing && Build.VERSION.SDK_INT >= 35 -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
             else -> ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
         }
-        currentTitle = if (swapping) "Swapping faces" else "Downloading models"
+        currentTitle = when (action) {
+            ACTION_SWAP -> "Swapping faces"
+            ACTION_PREVIEW -> "Previewing one frame"
+            else -> "Downloading models"
+        }
         val title = currentTitle
         startForeground(NOTIFICATION_ID, notification(title, "Starting", null), currentType)
         Jobs.post(JobStatus.Running(title, "Starting", null))
@@ -63,7 +67,11 @@ class SwapService : Service() {
         cancelled = false
         worker = Thread({
             val result = try {
-                if (swapping) swap(intent) else download()
+                when (action) {
+                    ACTION_SWAP -> swap(intent)
+                    ACTION_PREVIEW -> preview(intent)
+                    else -> download()
+                }
             } catch (e: CancellationException) {
                 JobStatus.Failed("Cancelled.")
             } catch (e: InterruptedException) {
@@ -75,7 +83,7 @@ class SwapService : Service() {
             }
             Jobs.post(result)
             finishNotification(result)
-            stopForeground(STOP_FOREGROUND_DETACH)
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }, "faceswap-worker").apply { start() }
         return START_NOT_STICKY
@@ -98,31 +106,62 @@ class SwapService : Service() {
         return JobStatus.Done("Models ready. ${ModelStore.LICENSE_NOTICE}", null)
     }
 
-    private fun swap(intent: Intent): JobStatus {
-        val title = "Swapping faces"
-        val video = Uri.parse(intent.getStringExtra(EXTRA_VIDEO))
-        val source = Uri.parse(intent.getStringExtra(EXTRA_SOURCE))
-        val reference = intent.getStringExtra(EXTRA_REFERENCE)?.let(Uri::parse)
+    /** Settings shared by a full swap and a one-frame preview. */
+    private class Request(intent: Intent) {
+        val video: Uri = Uri.parse(intent.getStringExtra(EXTRA_VIDEO))
+        val source: Uri = Uri.parse(intent.getStringExtra(EXTRA_SOURCE))
+        val reference: Uri? = intent.getStringExtra(EXTRA_REFERENCE)?.let(Uri::parse)
         val mode = SwapMode.valueOf(intent.getStringExtra(EXTRA_MODE) ?: SwapMode.ALL.name)
         val threshold = intent.getFloatExtra(EXTRA_THRESHOLD, 0.35f)
         val label = if (intent.getBooleanExtra(EXTRA_LABEL, true)) DEFAULT_LABEL else null
         val previewUs = intent.getLongExtra(EXTRA_PREVIEW_US, 0L).takeIf { it > 0 }
+        val frameAtUs = intent.getLongExtra(EXTRA_FRAME_AT_US, 0L)
+    }
 
+    /** Load the models and the face identities, then build the per-frame swap. */
+    private fun <T> withProcessor(req: Request, title: String, block: (FrameProcessor) -> T): T {
         report(title, "Loading models", null)
+        return FaceEngine(ModelStore(this).load()).use { engine ->
+            report(title, "Reading faces", null)
+            val src = engine.faceFromStill(decodeImage(this, req.source).toRgbImage(), "source photo")
+            val ref = if (req.mode == SwapMode.REFERENCE) {
+                val refUri = req.reference ?: throw NoFaceException("Pick a reference photo.")
+                engine.faceFromStill(decodeImage(this, refUri).toRgbImage(), "reference photo").embedding
+            } else {
+                null
+            }
+            val latent = engine.swapper.latent(src.embedding!!)
+            block(FrameProcessor { frame -> engine.swapFrame(frame, latent, req.mode, ref, req.threshold) })
+        }
+    }
+
+    private fun preview(intent: Intent): JobStatus {
+        val req = Request(intent)
+        val title = "Previewing one frame"
+        return withProcessor(req, title) { processor ->
+            report(title, "Swapping", null)
+            val frame = VideoTranscoder(this).frameAt(req.video, req.frameAtUs)
+            val before = frame.toBitmap()
+            val n = processor.process(frame)
+            req.label?.let { LabelOverlay(it, frame.width, frame.height).drawOn(frame) }
+            val message = when (n) {
+                0 -> "No face was swapped in this frame. Try another moment, or check the mode and threshold."
+                1 -> "1 face swapped in this frame."
+                else -> "$n faces swapped in this frame."
+            }
+            JobStatus.Preview(before, frame.toBitmap(), message)
+        }
+    }
+
+    private fun swap(intent: Intent): JobStatus {
+        val req = Request(intent)
+        val title = "Swapping faces"
         val temp = File(cacheDir, "swap_${System.currentTimeMillis()}.mp4")
         try {
-            FaceEngine(ModelStore(this).load()).use { engine ->
-                report(title, "Reading faces", null)
-                val src = engine.faceFromStill(decodeImage(this, source).toRgbImage(), "source photo")
-                val ref = if (mode == SwapMode.REFERENCE) {
-                    engine.faceFromStill(decodeImage(this, reference ?: throw NoFaceException("Pick a reference photo.")).toRgbImage(), "reference photo").embedding
-                } else {
-                    null
-                }
-                val settings = SwapSettings(engine.swapper.latent(src.embedding!!), mode, ref, threshold, label, previewUs)
+            return withProcessor(req, title) { processor ->
                 val started = SystemClock.elapsedRealtime()
-                val stats = VideoSwapper(this, engine).run(
-                    video, temp, settings,
+                val stats = VideoTranscoder(this).run(
+                    req.video, temp, processor, req.label, req.previewUs,
                     progress = { f, s ->
                         val secs = (SystemClock.elapsedRealtime() - started) / 1000.0
                         val eta = if (f > 0.01f) " · ~${((secs / f - secs) / 60).roundToInt()} min left" else ""
@@ -137,7 +176,7 @@ class SwapService : Service() {
                     AudioResult.NONE -> " No audio track."
                     AudioResult.UNSUPPORTED -> " Audio format couldn't be copied; output is silent."
                 }
-                return JobStatus.Done(
+                JobStatus.Done(
                     "Saved to Movies/FaceSwap. ${stats.frames} frames, ${stats.faces} faces swapped " +
                         "in ${stats.framesWithSwap} frames.$audio",
                     uri,
@@ -183,7 +222,7 @@ class SwapService : Service() {
         val text = when (status) {
             is JobStatus.Done -> status.message
             is JobStatus.Failed -> status.message
-            else -> return
+            else -> return // previews are shown in the app
         }
         val done = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
@@ -222,6 +261,7 @@ class SwapService : Service() {
     companion object {
         const val ACTION_DOWNLOAD = "io.github.slayer8366.faceswap.DOWNLOAD"
         const val ACTION_SWAP = "io.github.slayer8366.faceswap.SWAP"
+        const val ACTION_PREVIEW = "io.github.slayer8366.faceswap.PREVIEW"
         const val ACTION_CANCEL = "io.github.slayer8366.faceswap.CANCEL"
         const val EXTRA_VIDEO = "video"
         const val EXTRA_SOURCE = "source"
@@ -230,6 +270,7 @@ class SwapService : Service() {
         const val EXTRA_THRESHOLD = "threshold"
         const val EXTRA_LABEL = "label"
         const val EXTRA_PREVIEW_US = "preview_us"
+        const val EXTRA_FRAME_AT_US = "frame_at_us"
         private const val CHANNEL_ID = "jobs"
         private const val NOTIFICATION_ID = 1
 

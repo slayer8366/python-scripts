@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -53,6 +54,13 @@ class MainActivity : Activity() {
     private lateinit var statusText: TextView
     private lateinit var cancelButton: Button
     private lateinit var resultRow: LinearLayout
+    private lateinit var previewAtLabel: TextView
+    private lateinit var previewAt: SeekBar
+    private lateinit var previewButton: Button
+    private lateinit var previewRow: LinearLayout
+    private lateinit var previewBefore: ImageView
+    private lateinit var previewAfter: ImageView
+    private var videoDurationMs = 0L
 
     private val statusListener: (JobStatus) -> Unit = { render(it) }
 
@@ -67,7 +75,7 @@ class MainActivity : Activity() {
         }
         sourceUri?.let { showThumb(sourceImage, it) }
         referenceUri?.let { showThumb(referenceImage, it) }
-        videoUri?.let { videoName.text = displayName(it) }
+        videoUri?.let(::onVideoChosen)
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -100,7 +108,7 @@ class MainActivity : Activity() {
         when (requestCode) {
             PICK_SOURCE -> { sourceUri = uri; showThumb(sourceImage, uri) }
             PICK_REFERENCE -> { referenceUri = uri; showThumb(referenceImage, uri) }
-            PICK_VIDEO -> { videoUri = uri; videoName.text = displayName(uri) }
+            PICK_VIDEO -> { videoUri = uri; onVideoChosen(uri) }
         }
         updateEnabled()
     }
@@ -123,17 +131,43 @@ class MainActivity : Activity() {
 
     private fun thresholdValue() = threshold.progress / 100f
 
-    private fun startSwap() {
+    private fun jobIntent(action: String): Intent {
         val mode = selectedMode()
-        val intent = Intent(this, SwapService::class.java).setAction(SwapService.ACTION_SWAP)
+        val intent = Intent(this, SwapService::class.java).setAction(action)
             .putExtra(SwapService.EXTRA_SOURCE, sourceUri.toString())
             .putExtra(SwapService.EXTRA_VIDEO, videoUri.toString())
             .putExtra(SwapService.EXTRA_MODE, mode.name)
             .putExtra(SwapService.EXTRA_THRESHOLD, thresholdValue())
             .putExtra(SwapService.EXTRA_LABEL, labelBox.isChecked)
             .putExtra(SwapService.EXTRA_PREVIEW_US, if (previewBox.isChecked) PREVIEW_US else 0L)
+            .putExtra(SwapService.EXTRA_FRAME_AT_US, previewAt.progress * 100_000L)
         if (mode == SwapMode.REFERENCE) intent.putExtra(SwapService.EXTRA_REFERENCE, referenceUri.toString())
-        startForegroundService(intent)
+        return intent
+    }
+
+    private fun onVideoChosen(uri: Uri) {
+        videoName.text = displayName(uri)
+        videoDurationMs = try {
+            MediaMetadataRetriever().run {
+                try {
+                    setDataSource(this@MainActivity, uri)
+                    extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                } finally {
+                    release()
+                }
+            }
+        } catch (e: Exception) {
+            0L
+        }
+        // Slider steps are 0.1 s; start a third of the way in, where faces are likelier than on frame one.
+        previewAt.max = (videoDurationMs / 100).toInt().coerceAtLeast(0)
+        previewAt.progress = previewAt.max / 3
+        updatePreviewAtLabel()
+    }
+
+    private fun updatePreviewAtLabel() {
+        val tenths = previewAt.progress
+        previewAtLabel.text = "Preview frame at %d:%02d.%d".format(tenths / 600, tenths / 10 % 60, tenths % 10)
     }
 
     private fun render(status: JobStatus) {
@@ -152,7 +186,13 @@ class MainActivity : Activity() {
                 resultUri = status.output
             }
             is JobStatus.Failed -> statusText.text = "Stopped: ${status.message}"
+            is JobStatus.Preview -> {
+                statusText.text = status.message
+                previewBefore.setImageBitmap(status.before)
+                previewAfter.setImageBitmap(status.after)
+            }
         }
+        previewRow.visibility = if (status is JobStatus.Preview) View.VISIBLE else View.GONE
         resultRow.visibility = if (!running && resultUri != null) View.VISIBLE else View.GONE
         refreshModels()
         updateEnabled()
@@ -173,8 +213,13 @@ class MainActivity : Activity() {
         val running = Jobs.isRunning
         val needsReference = selectedMode() == SwapMode.REFERENCE
         downloadButton.isEnabled = !running
-        swapButton.isEnabled = !running && models.isReady && consentBox.isChecked &&
+        val ready = !running && models.isReady && consentBox.isChecked &&
             sourceUri != null && videoUri != null && (!needsReference || referenceUri != null)
+        swapButton.isEnabled = ready
+        previewButton.isEnabled = ready
+        val hasVideo = videoUri != null && videoDurationMs > 0
+        previewAtLabel.visibility = if (hasVideo) View.VISIBLE else View.GONE
+        previewAt.visibility = if (hasVideo) View.VISIBLE else View.GONE
         referenceSection.visibility = if (needsReference) View.VISIBLE else View.GONE
     }
 
@@ -278,14 +323,43 @@ class MainActivity : Activity() {
 
         section("5. Options")
         labelBox = CheckBox(this).apply { text = "Burn in \"AI-GENERATED\" label"; isChecked = true }.also(::add)
-        previewBox = CheckBox(this).apply { text = "Quick preview: first 5 seconds only"; isChecked = true }.also(::add)
+        previewBox = CheckBox(this).apply { text = "Only process the first 5 seconds"; isChecked = true }.also(::add)
         consentBox = CheckBox(this).apply {
             text = "Everyone whose face is used or replaced has agreed to it"
             setOnCheckedChangeListener { _, _ -> updateEnabled() }
         }.also(::add)
         add(text("Expect several seconds per frame per face on a phone.", 12f))
 
-        swapButton = button("Swap faces") { startSwap() }.also(::add)
+        section("6. Check one frame first")
+        previewAtLabel = text("", 13f).also(::add)
+        previewAt = SeekBar(this).apply {
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) = updatePreviewAtLabel()
+                override fun onStartTrackingTouch(s: SeekBar) = Unit
+                override fun onStopTrackingTouch(s: SeekBar) = Unit
+            })
+        }.also(::add)
+        previewButton = button("Preview one frame") {
+            startForegroundService(jobIntent(SwapService.ACTION_PREVIEW))
+        }.also(::add)
+        previewBefore = ImageView(this).apply { adjustViewBounds = true }
+        previewAfter = ImageView(this).apply { adjustViewBounds = true }
+        previewRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            fun half(label: String, image: ImageView) = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(2), 0, dp(2), 0)
+                addView(text(label, 12f))
+                addView(image, MATCH_PARENT, WRAP_CONTENT)
+            }
+            addView(half("Before", previewBefore), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(half("After", previewAfter), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            visibility = View.GONE
+        }.also(::add)
+
+        section("7. Swap the video")
+
+        swapButton = button("Swap faces") { startForegroundService(jobIntent(SwapService.ACTION_SWAP)) }.also(::add)
         progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 1000
             visibility = View.GONE

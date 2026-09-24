@@ -14,6 +14,11 @@ and saves an MP4 to `Movies/FaceSwap`. Nothing is uploaded anywhere.
 
 On first launch, tap **Download models** (about 840 MB, Wi-Fi advised).
 
+Before a long run, use **Preview one frame**: pick a moment with the slider
+and the app swaps just that frame, showing before and after. It decodes the
+frame through the same pipeline as the full run, so what you see is what
+the video will get.
+
 ## Requirements
 
 - Android 10 (API 29) or newer, 64-bit.
@@ -63,12 +68,26 @@ FACESWAP_MODEL_DIR=~/.insightface FACESWAP_GOLDEN_DIR=/tmp/golden ./gradlew -Pco
   description. `MediaMuxer` can't write a comment tag into the MP4 itself.
 - If the encoder can't handle the source resolution, output is scaled down.
 
+## Tests
+
+- `core/`: JVM unit tests plus the Python comparison tests above.
+- `app/src/androidTest`: instrumented tests of the video pipeline, run in CI
+  on API 29 and API 35 emulators. They generate their own clips with
+  `MediaCodec` (no fixtures) and check the output with
+  `MediaMetadataRetriever`, an independent decoder, covering frame count,
+  colours, audio passthrough and duration, upright rotation, frame seeking for
+  the preview, and the 5-second limit. The per-frame step is a painted
+  stand-in, so no models are needed. The face engine itself is covered by
+  the core tests.
+- Android Lint runs in CI and fails the build on errors such as API-level misuse.
+
 ## Not verified yet
 
 These need a real device:
 
 - Speed per frame and memory headroom on actual phones.
-- `MediaCodec` behaviour across vendors (plane layouts, encoder input sizes).
+- `MediaCodec` behaviour on vendor codecs. The emulators use Google's
+  software codecs; Qualcomm, Exynos and MediaTek hardware codecs can differ.
 - Audio passthrough for non-AAC tracks (falls back to silent output with a note).
 
 ## Model licence

@@ -9,10 +9,8 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
-import io.github.slayer8366.faceswap.core.FaceEngine
 import io.github.slayer8366.faceswap.core.Plane
 import io.github.slayer8366.faceswap.core.RgbImage
-import io.github.slayer8366.faceswap.core.SwapMode
 import io.github.slayer8366.faceswap.core.YuvMatrix
 import io.github.slayer8366.faceswap.core.rgbToYuv420
 import io.github.slayer8366.faceswap.core.yuv420ToRgb
@@ -20,15 +18,10 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.CancellationException
 
-class SwapSettings(
-    val latent: FloatArray,
-    val mode: SwapMode,
-    val reference: FloatArray?,
-    val threshold: Float,
-    val label: String?,
-    /** Stop after this much video, for quick previews. */
-    val maxDurationUs: Long?,
-)
+/** Edits one upright frame in place and returns how many faces it replaced. */
+fun interface FrameProcessor {
+    fun process(frame: RgbImage): Int
+}
 
 class SwapStats(var frames: Int = 0, var framesWithSwap: Int = 0, var faces: Int = 0, var audio: AudioResult = AudioResult.NONE)
 
@@ -37,109 +30,150 @@ enum class AudioResult { NONE, COPIED, UNSUPPORTED }
 class UnsupportedVideoException(message: String) : Exception(message)
 
 /**
- * Decodes [input] with MediaCodec, swaps faces frame by frame, and encodes
- * H.264 into an MP4 at [output], copying the original audio track.
+ * Decodes video with MediaCodec, hands each frame to a [FrameProcessor],
+ * and encodes H.264 into an MP4, copying the original audio track.
  *
  * Frames are rotated upright before processing (the detector expects
  * upright faces), so the output carries no rotation flag. Presentation
  * timestamps are kept, so variable-frame-rate phone video stays in sync.
  */
-class VideoSwapper(private val context: Context, private val engine: FaceEngine) {
+class VideoTranscoder(private val context: Context) {
     private val timeoutUs = 10_000L
 
     fun run(
         input: Uri,
         output: File,
-        settings: SwapSettings,
+        processor: FrameProcessor,
+        label: String?,
+        /** Stop after this much video, for quick previews. */
+        maxDurationUs: Long?,
         progress: (Float, SwapStats) -> Unit,
         cancelled: () -> Boolean,
     ): SwapStats {
-        val extractor = MediaExtractor().apply { setDataSource(context, input, null) }
-        val videoTrack = (0 until extractor.trackCount).firstOrNull { mime(extractor.getTrackFormat(it)).startsWith("video/") }
-            ?: throw UnsupportedVideoException("No video track found.")
-        val inFormat = extractor.getTrackFormat(videoTrack)
-        extractor.selectTrack(videoTrack)
-        val rotation = inFormat.intOr(MediaFormat.KEY_ROTATION, 0)
-        val durationUs = inFormat.longOr(MediaFormat.KEY_DURATION, 0L)
-        val fps = inFormat.intOr(MediaFormat.KEY_FRAME_RATE, 30).coerceIn(1, 240)
-        val endUs = settings.maxDurationUs?.let { if (durationUs > 0) minOf(it, durationUs) else it } ?: durationUs
-
-        val decoder = MediaCodec.createDecoderByType(mime(inFormat))
-        inFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-        decoder.configure(inFormat, null, null, 0)
-        decoder.start()
-
         val stats = SwapStats()
         var encoder: Encoder? = null
-        var matrix = defaultMatrix(inFormat.intOr(MediaFormat.KEY_HEIGHT, 1080))
         var firstPtsUs = -1L
         var lastPtsUs = 0L
-        val info = MediaCodec.BufferInfo()
-        var inputDone = false
-        var decodeDone = false
         try {
-            while (!decodeDone) {
-                if (cancelled()) throw CancellationException("Cancelled")
-                if (!inputDone) {
-                    val idx = decoder.dequeueInputBuffer(timeoutUs)
-                    if (idx >= 0) {
-                        val buf = decoder.getInputBuffer(idx)!!
-                        val n = extractor.readSampleData(buf, 0)
-                        val t = extractor.sampleTime
-                        if (n < 0 || (settings.maxDurationUs != null && t > settings.maxDurationUs)) {
-                            decoder.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                            inputDone = true
-                        } else {
-                            decoder.queueInputBuffer(idx, 0, n, t, 0)
-                            extractor.advance()
-                        }
-                    }
+            decodeFrames(input, 0L, maxDurationUs, cancelled) { video, upright, ptsUs ->
+                val enc = encoder ?: Encoder(upright.width, upright.height, video.fps, output).also {
+                    encoder = it
+                    it.prepareAudio(input)
                 }
-                val idx = decoder.dequeueOutputBuffer(info, timeoutUs)
-                when {
-                    idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> matrix = matrixFor(decoder.outputFormat) ?: matrix
-                    idx >= 0 -> {
-                        val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
-                        val within = settings.maxDurationUs == null || info.presentationTimeUs <= settings.maxDurationUs
-                        if (info.size > 0 && within) {
-                            val frame = decoder.getOutputImage(idx)?.use { readFrame(it, matrix) }
-                                ?: throw UnsupportedVideoException("This phone's decoder doesn't expose readable frames for this video.")
-                            decoder.releaseOutputBuffer(idx, false)
-                            val upright = frame.rotate(rotation)
-                            val enc = encoder ?: Encoder(upright.width, upright.height, fps, output).also {
-                                encoder = it
-                                it.prepareAudio(input)
-                            }
-                            val fitted = enc.fit(upright)
-                            val n = engine.swapFrame(fitted, settings.latent, settings.mode, settings.reference, settings.threshold)
-                            enc.label(settings.label)?.drawOn(fitted)
-                            enc.encode(fitted, info.presentationTimeUs)
-                            stats.frames++
-                            stats.faces += n
-                            if (n > 0) stats.framesWithSwap++
-                            if (firstPtsUs < 0) firstPtsUs = info.presentationTimeUs
-                            lastPtsUs = info.presentationTimeUs
-                            val span = endUs - maxOf(firstPtsUs, 0L)
-                            progress(if (span > 0) ((lastPtsUs - firstPtsUs).toFloat() / span).coerceIn(0f, 1f) else 0f, stats)
-                        } else {
-                            decoder.releaseOutputBuffer(idx, false)
-                        }
-                        if (eos) decodeDone = true
-                    }
-                }
+                val fitted = enc.fit(upright)
+                val n = processor.process(fitted)
+                enc.label(label)?.drawOn(fitted)
+                enc.encode(fitted, ptsUs)
+                stats.frames++
+                stats.faces += n
+                if (n > 0) stats.framesWithSwap++
+                if (firstPtsUs < 0) firstPtsUs = ptsUs
+                lastPtsUs = ptsUs
+                val endUs = maxDurationUs?.let { if (video.durationUs > 0) minOf(it, video.durationUs) else it } ?: video.durationUs
+                val span = endUs - firstPtsUs
+                progress(if (span > 0) ((lastPtsUs - firstPtsUs).toFloat() / span).coerceIn(0f, 1f) else 0f, stats)
+                true
             }
             val enc = encoder ?: throw UnsupportedVideoException("No frames could be decoded.")
             enc.finish(cancelled)
-            stats.audio = enc.copyAudio(lastPtsUs, settings.maxDurationUs)
+            stats.audio = enc.copyAudio(lastPtsUs, maxDurationUs)
             enc.close()
             encoder = null
         } finally {
             encoder?.abort()
-            decoder.stop()
-            decoder.release()
-            extractor.release()
         }
         return stats
+    }
+
+    /**
+     * The first frame at or after [timeUs], upright, decoded exactly as
+     * [run] decodes it, so a preview matches the final output.
+     */
+    fun frameAt(input: Uri, timeUs: Long): RgbImage {
+        var result: RgbImage? = null
+        decodeFrames(input, timeUs, null, { false }) { _, upright, ptsUs ->
+            if (ptsUs >= timeUs) result = upright
+            result == null
+        }
+        return result ?: throw UnsupportedVideoException("No frame found at ${timeUs / 1000} ms.")
+    }
+
+    class VideoInfo(val durationUs: Long, val fps: Int, val rotation: Int)
+
+    /**
+     * Decode from the sync frame before [startUs] up to [maxUs], passing each
+     * upright frame and its timestamp to [onFrame] until it returns false.
+     */
+    private fun decodeFrames(
+        input: Uri,
+        startUs: Long,
+        maxUs: Long?,
+        cancelled: () -> Boolean,
+        onFrame: (VideoInfo, RgbImage, Long) -> Boolean,
+    ): VideoInfo {
+        val extractor = MediaExtractor().apply { setDataSource(context, input, null) }
+        try {
+            val videoTrack = (0 until extractor.trackCount).firstOrNull { mime(extractor.getTrackFormat(it)).startsWith("video/") }
+                ?: throw UnsupportedVideoException("No video track found.")
+            val inFormat = extractor.getTrackFormat(videoTrack)
+            extractor.selectTrack(videoTrack)
+            if (startUs > 0) extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            val video = VideoInfo(
+                durationUs = inFormat.longOr(MediaFormat.KEY_DURATION, 0L),
+                fps = inFormat.intOr(MediaFormat.KEY_FRAME_RATE, 30).coerceIn(1, 240),
+                rotation = inFormat.intOr(MediaFormat.KEY_ROTATION, 0),
+            )
+
+            val decoder = MediaCodec.createDecoderByType(mime(inFormat))
+            try {
+                inFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+                decoder.configure(inFormat, null, null, 0)
+                decoder.start()
+                var matrix = defaultMatrix(inFormat.intOr(MediaFormat.KEY_HEIGHT, 1080))
+                val info = MediaCodec.BufferInfo()
+                var inputDone = false
+                while (true) {
+                    if (cancelled()) throw CancellationException("Cancelled")
+                    if (!inputDone) {
+                        val idx = decoder.dequeueInputBuffer(timeoutUs)
+                        if (idx >= 0) {
+                            val buf = decoder.getInputBuffer(idx)!!
+                            val n = extractor.readSampleData(buf, 0)
+                            val t = extractor.sampleTime
+                            if (n < 0 || (maxUs != null && t > maxUs)) {
+                                decoder.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                inputDone = true
+                            } else {
+                                decoder.queueInputBuffer(idx, 0, n, t, 0)
+                                extractor.advance()
+                            }
+                        }
+                    }
+                    val idx = decoder.dequeueOutputBuffer(info, timeoutUs)
+                    if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        matrix = matrixFor(decoder.outputFormat) ?: matrix
+                    } else if (idx >= 0) {
+                        val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                        val pts = info.presentationTimeUs
+                        val wanted = info.size > 0 && (maxUs == null || pts <= maxUs)
+                        val frame = if (wanted) {
+                            decoder.getOutputImage(idx)?.use { readFrame(it, matrix) }
+                                ?: throw UnsupportedVideoException("This phone's decoder doesn't expose readable frames for this video.")
+                        } else {
+                            null
+                        }
+                        decoder.releaseOutputBuffer(idx, false)
+                        if (frame != null && !onFrame(video, frame.rotate(video.rotation), pts)) return video
+                        if (eos) return video
+                    }
+                }
+            } finally {
+                runCatching { decoder.stop() }
+                decoder.release()
+            }
+        } finally {
+            extractor.release()
+        }
     }
 
     /** Copy the decoder's output image (cropped) into RGB. */

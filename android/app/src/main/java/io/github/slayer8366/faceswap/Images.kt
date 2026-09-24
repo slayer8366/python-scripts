@@ -41,6 +41,16 @@ fun Bitmap.toRgbImage(): RgbImage {
     return img
 }
 
+fun RgbImage.toBitmap(): Bitmap {
+    val px = IntArray(width * height) { i ->
+        val r = data[i * 3].toInt() and 0xFF
+        val g = data[i * 3 + 1].toInt() and 0xFF
+        val b = data[i * 3 + 2].toInt() and 0xFF
+        Color.rgb(r, g, b)
+    }
+    return Bitmap.createBitmap(px, width, height, Bitmap.Config.ARGB_8888)
+}
+
 /** The visible disclosure label, pre-rendered once per output size. */
 class LabelOverlay(text: String, frameWidth: Int, frameHeight: Int) {
     val pixels: IntArray
