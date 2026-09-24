@@ -17,6 +17,7 @@ import android.provider.MediaStore
 import io.github.slayer8366.faceswap.core.FaceEngine
 import io.github.slayer8366.faceswap.core.NoFaceException
 import io.github.slayer8366.faceswap.core.SwapMode
+import io.github.slayer8366.faceswap.core.TrackingSwapper
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -70,7 +71,7 @@ class SwapService : Service() {
                 when (action) {
                     ACTION_SWAP -> swap(intent)
                     ACTION_PREVIEW -> preview(intent)
-                    else -> download()
+                    else -> download(intent)
                 }
             } catch (e: CancellationException) {
                 JobStatus.Failed("Cancelled.")
@@ -94,9 +95,11 @@ class SwapService : Service() {
         cancelled = true
     }
 
-    private fun download(): JobStatus {
+    private fun download(intent: Intent): JobStatus {
         val title = "Downloading models"
+        val variant = SwapModel.valueOf(intent.getStringExtra(EXTRA_MODEL) ?: SwapModel.FAST.name)
         ModelStore(this).download(
+            variant,
             progress = { done, total ->
                 val f = if (total > 0) done.toFloat() / total else null
                 report(title, "%d / %d MB".format(done shr 20, total shr 20), f)
@@ -116,12 +119,17 @@ class SwapService : Service() {
         val label = if (intent.getBooleanExtra(EXTRA_LABEL, true)) DEFAULT_LABEL else null
         val previewUs = intent.getLongExtra(EXTRA_PREVIEW_US, 0L).takeIf { it > 0 }
         val frameAtUs = intent.getLongExtra(EXTRA_FRAME_AT_US, 0L)
+        val model = SwapModel.valueOf(intent.getStringExtra(EXTRA_MODEL) ?: SwapModel.FAST.name)
+        val cropTracking = intent.getBooleanExtra(EXTRA_CROP_TRACKING, false)
     }
 
-    /** Load the models and the face identities, then build the per-frame swap. */
-    private fun <T> withProcessor(req: Request, title: String, block: (FrameProcessor) -> T): T {
+    /** What a job needs once the models and face identities are loaded. */
+    private class Loaded(val engine: FaceEngine, val latent: FloatArray, val reference: FloatArray?)
+
+    /** Load the models and the face identities for [req]. */
+    private fun <T> withEngine(req: Request, title: String, block: (Loaded) -> T): T {
         report(title, "Loading models", null)
-        return FaceEngine(ModelStore(this).load()).use { engine ->
+        return FaceEngine(ModelStore(this).load(req.model)).use { engine ->
             report(title, "Reading faces", null)
             val src = engine.faceFromStill(decodeImage(this, req.source).toRgbImage(), "source photo")
             val ref = if (req.mode == SwapMode.REFERENCE) {
@@ -130,19 +138,18 @@ class SwapService : Service() {
             } else {
                 null
             }
-            val latent = engine.swapper.latent(src.embedding!!)
-            block(FrameProcessor { frame -> engine.swapFrame(frame, latent, req.mode, ref, req.threshold) })
+            block(Loaded(engine, engine.swapper.latent(src.embedding!!), ref))
         }
     }
 
     private fun preview(intent: Intent): JobStatus {
         val req = Request(intent)
         val title = "Previewing one frame"
-        return withProcessor(req, title) { processor ->
+        return withEngine(req, title) { l ->
             report(title, "Swapping", null)
             val frame = VideoTranscoder(this).frameAt(req.video, req.frameAtUs)
             val before = frame.toBitmap()
-            val n = processor.process(frame)
+            val n = l.engine.swapFrame(frame, l.latent, req.mode, l.reference, req.threshold)
             req.label?.let { LabelOverlay(it, frame.width, frame.height).drawOn(frame) }
             val message = when (n) {
                 0 -> "No face was swapped in this frame. Try another moment, or check the mode and threshold."
@@ -158,7 +165,11 @@ class SwapService : Service() {
         val title = "Swapping faces"
         val temp = File(cacheDir, "swap_${System.currentTimeMillis()}.mp4")
         try {
-            return withProcessor(req, title) { processor ->
+            return withEngine(req, title) { l ->
+                // Links faces across frames so reference matches are cached;
+                // crop tracking (opt-in) also skips most full-frame detections.
+                val swapper = TrackingSwapper(l.engine, l.latent, req.mode, l.reference, req.threshold, req.cropTracking)
+                val processor = FrameProcessor(swapper::process)
                 val started = SystemClock.elapsedRealtime()
                 val stats = VideoTranscoder(this).run(
                     req.video, temp, processor, req.label, req.previewUs,
@@ -271,6 +282,8 @@ class SwapService : Service() {
         const val EXTRA_LABEL = "label"
         const val EXTRA_PREVIEW_US = "preview_us"
         const val EXTRA_FRAME_AT_US = "frame_at_us"
+        const val EXTRA_MODEL = "model"
+        const val EXTRA_CROP_TRACKING = "crop_tracking"
         private const val CHANNEL_ID = "jobs"
         private const val NOTIFICATION_ID = 1
 

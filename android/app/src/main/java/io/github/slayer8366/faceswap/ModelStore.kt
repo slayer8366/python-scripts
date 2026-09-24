@@ -18,6 +18,16 @@ import java.util.zip.ZipInputStream
  * SHA-256 hashes before use. The weights are licensed for non-commercial
  * research only.
  */
+/**
+ * Which swap model to use. FAST is an int8 build of inswapper_128: about 2.7x
+ * faster on CPU, with an identity-similarity drop of 0.005 and a mean pixel
+ * difference of 2.4/255 against FULL on held-out faces (desktop measurements).
+ */
+enum class SwapModel(val label: String, val downloadMb: Int) {
+    FAST("Fast (int8)", 466),
+    FULL("Full precision", 843),
+}
+
 class ModelStore(context: Context) {
     private val dir = File(context.noBackupFilesDir, "models")
 
@@ -26,22 +36,33 @@ class ModelStore(context: Context) {
     private val detector = Asset("det_10g.onnx", "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91")
     private val recognizer = Asset("w600k_r50.onnx", "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43")
     private val swapper = Asset("inswapper_128.onnx", "e4a3f08c753cb72d04e10aa0f7dbe3deebbf39567d4ead6dce08e98aa49e16af")
-    private val emapCache = File(dir, "inswapper_emap.bin")
+    // Built from the official model by android/tools/quantize_swapper.py in the
+    // swap-model-int8 workflow; the build is reproducible byte for byte.
+    private val swapperInt8 = Asset("inswapper_128_int8.onnx", "cfbfd8518e79a1f672550963be173936b6ee58130ee757aec08094335d08cd65")
+    private val emapAsset = Asset("inswapper_emap.bin", "4e823c24cc60c3796fcd5bc68ab3743e7357aa9c97af9f9ebb5f4234d9bd5c1e")
+    private val emapCache = File(dir, emapAsset.file)
 
-    val isReady: Boolean
-        get() = listOf(detector, recognizer, swapper).all { File(dir, it.file).isFile }
+    private fun has(a: Asset) = File(dir, a.file).isFile
 
-    /** Download whatever is missing. [progress] gets (bytes done, bytes total). */
-    fun download(progress: (Long, Long) -> Unit, cancelled: () -> Boolean) {
+    fun isReady(variant: SwapModel): Boolean = has(detector) && has(recognizer) && when (variant) {
+        SwapModel.FAST -> has(swapperInt8) && has(emapAsset)
+        SwapModel.FULL -> has(swapper)
+    }
+
+    /** Download whatever [variant] still needs. [progress] gets (bytes done, bytes total). */
+    fun download(variant: SwapModel, progress: (Long, Long) -> Unit, cancelled: () -> Boolean) {
         dir.mkdirs()
-        val needSwapper = !File(dir, swapper.file).isFile
-        val needPack = !File(dir, detector.file).isFile || !File(dir, recognizer.file).isFile
-        val total = (if (needSwapper) SWAPPER_BYTES else 0L) + (if (needPack) PACK_BYTES else 0L)
+        val needPack = !has(detector) || !has(recognizer)
+        val singles = when (variant) {
+            SwapModel.FAST -> listOf(swapperInt8 to (FAST_URL to INT8_BYTES), emapAsset to (FAST_URL to EMAP_BYTES))
+            SwapModel.FULL -> listOf(swapper to (RELEASE_URL to SWAPPER_BYTES))
+        }.filterNot { has(it.first) }
+        val total = singles.sumOf { it.second.second } + if (needPack) PACK_BYTES else 0L
         var done = 0L
         val report = { n: Long -> done += n; progress(done, total) }
 
-        if (needSwapper) {
-            open(RELEASE_URL + swapper.file).use { input -> save(input, swapper, report, cancelled) }
+        for ((asset, source) in singles) {
+            open(source.first + asset.file).use { input -> save(input, asset, report, cancelled) }
         }
         if (needPack) {
             // Stream the zip and keep only the two files we need, so the
@@ -57,23 +78,22 @@ class ModelStore(context: Context) {
                     }
                 }
             }
-            check(File(dir, detector.file).isFile && File(dir, recognizer.file).isFile) {
-                "buffalo_l.zip did not contain the expected models"
-            }
+            check(has(detector) && has(recognizer)) { "buffalo_l.zip did not contain the expected models" }
         }
     }
 
-    /** Model paths plus the swapper projection, extracted once and cached. */
-    fun load(): ModelFiles {
-        check(isReady) { "Models are not downloaded" }
-        val swapFile = File(dir, swapper.file)
-        val emap = if (emapCache.length() == 512L * 512 * 4) {
-            DataInputStream(emapCache.inputStream().buffered()).use { s -> FloatArray(512 * 512) { s.readFloat() } }
-        } else {
-            OnnxInitializers.lastInitializer(swapFile).data.also { data ->
-                DataOutputStream(emapCache.outputStream().buffered()).use { s -> data.forEach(s::writeFloat) }
-            }
+    /** Model paths plus the swapper's embedding projection. */
+    fun load(variant: SwapModel): ModelFiles {
+        check(isReady(variant)) { "Models are not downloaded" }
+        val swapFile = File(dir, if (variant == SwapModel.FAST) swapperInt8.file else swapper.file)
+        // The fast variant downloads the projection (quantization drops it from
+        // the graph); the full model carries it, extracted once and cached in
+        // the same big-endian format.
+        if (emapCache.length() != 512L * 512 * 4) {
+            val data = OnnxInitializers.lastInitializer(File(dir, swapper.file)).data
+            DataOutputStream(emapCache.outputStream().buffered()).use { s -> data.forEach(s::writeFloat) }
         }
+        val emap = DataInputStream(emapCache.inputStream().buffered()).use { s -> FloatArray(512 * 512) { s.readFloat() } }
         return ModelFiles(File(dir, detector.file), File(dir, recognizer.file), swapFile, emap)
     }
 
@@ -128,7 +148,11 @@ class ModelStore(context: Context) {
         const val RELEASE_URL = "https://github.com/deepinsight/insightface/releases/download/model-zoo/"
         const val SWAPPER_BYTES = 554_253_681L
         const val PACK_BYTES = 288_621_354L
+        const val FAST_URL = "https://github.com/slayer8366/python-scripts/releases/download/swap-model-int8-v1/"
+        const val INT8_BYTES = 176_530_283L
+        const val EMAP_BYTES = 1_048_576L
         const val LICENSE_NOTICE =
-            "Models: InsightFace buffalo_l and inswapper_128, licensed for non-commercial research use only."
+            "Models: InsightFace buffalo_l and inswapper_128 (and the int8 build of it), licensed for " +
+                "non-commercial research use only."
     }
 }

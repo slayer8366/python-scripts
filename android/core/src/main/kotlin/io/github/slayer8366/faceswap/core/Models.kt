@@ -48,7 +48,10 @@ class ScrfdDetector(
     private val inputName = session.inputNames.first()
     private val numAnchors = 2
 
-    fun detect(img: RgbImage): List<Face> {
+    /** Detect faces, resizing [img] to fit an [size] x [size] input (a multiple of 32). */
+    fun detect(img: RgbImage, size: Int = inputSize): List<Face> {
+        require(size % 32 == 0) { "SCRFD input size must be a multiple of 32, got $size" }
+        val inputSize = size
         val imRatio = img.height.toDouble() / img.width
         val (newW, newH) = if (imRatio > 1.0) {
             (inputSize / imRatio).toInt() to inputSize

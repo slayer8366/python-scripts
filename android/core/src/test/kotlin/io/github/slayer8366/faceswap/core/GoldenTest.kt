@@ -157,7 +157,7 @@ class GoldenTest {
 }
 
 /** Just enough JSON for golden.json: objects, arrays, numbers, strings. */
-private object Json {
+internal object Json {
     fun parse(s: String): Any? = Parser(s).value()
 
     private class Parser(val s: String) {
